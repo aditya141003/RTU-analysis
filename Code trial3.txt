@@ -1,0 +1,188 @@
+import os
+import pandas as pd
+
+# Function to process each RTU file
+def process_rtu_file(file_path):
+    # Extract location name and RTU name from the file name
+    file_name = os.path.basename(file_path)
+    directry_path = os.path.dirname(file_path)
+    split_name = os.path.splitext(file_name)[0].split('_')
+    if len(split_name) != 2:
+        print(f"Skipping file {file_name}: Unexpected filename format.")
+        return None
+    
+    location_name, rtu_name = split_name
+
+    # Load the Excel file
+    xls = pd.ExcelFile(file_path)
+
+    # Check if the workbook contains exactly 3 sheets
+    if len(xls.sheet_names) != 3:
+        print(f"Skipping file {file_name}: Workbook does not contain exactly 3 sheets.")
+        return None
+
+    # Read all three sheets
+    sheet1 = pd.read_excel(xls, sheet_name=xls.sheet_names[0])
+    sheet2 = pd.read_excel(xls, sheet_name=xls.sheet_names[1])
+    sheet3 = pd.read_excel(xls, sheet_name=xls.sheet_names[2])
+
+    # Merge sheets on the 'Timestamp' column, allowing for 60 seconds tolerance
+    merged_df = pd.merge_asof(sheet1.sort_values('Timestamp'), sheet2.sort_values('Timestamp'), on='Timestamp', tolerance=pd.Timedelta('60s'))
+    merged_df = pd.merge_asof(merged_df.sort_values('Timestamp'), sheet3.sort_values('Timestamp'), on='Timestamp', tolerance=pd.Timedelta('60s'))
+
+    # Drop unwanted columns
+    drop_columns = ["kWh", "kVAR", "kVA", "van", "vbn", "vcn", "Peak kW", "Demand kW", "Power Factor", "Validity", "Master SP", "DeltaT", "Strategy", "State Descrip", "Run Time", "CO2", "Fan Mode", "Fan Desc"]
+    merged_df.drop(columns=[col for col in drop_columns if col in merged_df.columns], inplace=True)
+
+    # Reorder columns
+    columns_order = ['Timestamp', '°F', 'Zone', 'Supply', 'kW', 'Cool SP', 'Heat SP'] + [col for col in merged_df.columns if col not in ['Timestamp', '°F', 'Zone', 'Supply', 'kW','Cool SP', 'Heat SP']]
+    merged_df = merged_df[columns_order]
+
+    # Drop rows with null or blank values in specific columns
+    merged_df.dropna(subset=['°F', 'Zone', 'Supply', 'kW'], inplace=True)
+
+    # Sort data by 'Timestamp'
+    merged_df.sort_values('Timestamp', inplace=True)
+
+    # Calculate the time difference between consecutive timestamps in seconds
+    merged_df['Time_diff'] = merged_df['Timestamp'].diff().dt.total_seconds().fillna(0).astype(int)
+    
+    merged_df['FA DT'] = merged_df['°F'] - merged_df['Supply']
+    merged_df['Return'] = merged_df.apply(lambda row: row['Zone'] - 2 if row['Zone'] > row['°F'] else row['Zone'] + 2, axis=1)
+    merged_df['RA DT'] = merged_df['Return'] - merged_df['Supply']
+    merged_df['Mode'] = merged_df['RA DT'].apply(lambda x: 'Heating' if x < 0 else 'Cooling')
+
+    
+    # Save the merged data to a new Excel file in the specified directory
+    new_directory2 = "Cleaned_Files"
+    directory_path2 = os.path.join(directry_path, new_directory2)
+    os.makedirs(directory_path2, exist_ok=True)
+    Mfilename = f"Cleaned_Merged_{location_name}_{rtu_name}.xlsx"
+    Merged_file_path = os.path.join(directory_path2, Mfilename)
+    merged_df.to_excel(Merged_file_path, index=False)
+    gu = 0
+    Reprting_Time_Stamp = "No_Time_stamp"
+    Name_Of_Check = "No_Check_Name"
+    text_strings = [location_name, rtu_name, str(Reprting_Time_Stamp), Name_Of_Check]
+    
+    Sub_List = []
+    # identify Unit ON OFF frequently
+    for i in range(1, len(merged_df)-1):
+        if merged_df.iloc[i-1]['kW'] > 1 and merged_df.iloc[i+1]['kW'] > 1 and merged_df.iloc[i]['kW'] == 0:
+            if 840 < merged_df.iloc[i]['Time_diff'] < 960 and 840 < merged_df.iloc[i+1]['Time_diff'] <960:
+                Reprting_Time_Stamp = merged_df.iloc[i]['Timestamp']
+                Name_Of_Check = "Unit Quick ON/Off within 15 min"
+                text_strings = [location_name, rtu_name, str(Reprting_Time_Stamp), Name_Of_Check]
+                gu += 1
+                Sub_List.append(text_strings)
+        elif gu == 0 and i == len(merged_df) - 2:
+            Name_Of_Check = "No findings on Unit Quick ON/Off within 15 min"
+            text_strings = [location_name, rtu_name, str(Reprting_Time_Stamp), Name_Of_Check]
+            Sub_List.append(text_strings)
+    
+    # Define a threshold for short cycling in minutes
+    short_cycle_threshold_minutes = 17
+    gu = 0
+    Reprting_Time_Stamp = "No_Time_stamp"
+    Name_Of_Check = "No_Check_Name"
+    time_diff_next1 = short_cycle_threshold_minutes + 1
+    time_diff_next2 = short_cycle_threshold_minutes + 1
+    time_diff_next3 = short_cycle_threshold_minutes + 1
+
+    for i in range(1, len(merged_df) - 3):
+        if merged_df.iloc[i]['kW'] > 3 and merged_df.iloc[i+1]['kW'] < 0.9 and merged_df.iloc[i+2]['kW'] > 3 and merged_df.iloc[i+3]['kW'] < 0.9:
+            time_diff_next1 = (merged_df.iloc[i+1]['Timestamp'] - merged_df.iloc[i]['Timestamp']).total_seconds() / 60.0
+            time_diff_next2 = (merged_df.iloc[i+2]['Timestamp'] - merged_df.iloc[i+1]['Timestamp']).total_seconds() / 60.0
+            time_diff_next3 = (merged_df.iloc[i+3]['Timestamp'] - merged_df.iloc[i+2]['Timestamp']).total_seconds() / 60.0
+            if time_diff_next1 < short_cycle_threshold_minutes and time_diff_next2 < short_cycle_threshold_minutes and time_diff_next3 < short_cycle_threshold_minutes:
+                Reprting_Time_Stamp = merged_df.iloc[i+2]['Timestamp']
+                Name_Of_Check = "Short Cycling Detected"
+                text_strings = [location_name, rtu_name, str(Reprting_Time_Stamp), Name_Of_Check]
+                gu += 1
+                Sub_List.append(text_strings)
+        elif gu == 0 and i == len(merged_df) - 4:
+            Name_Of_Check = "No findings on Short Cycling Detected"
+            text_strings = [location_name, rtu_name, str(Reprting_Time_Stamp), Name_Of_Check]
+            Sub_List.append(text_strings)
+            
+            
+    # identify Unit Free cooling scope
+    gu = 0
+    Reprting_Time_Stamp = "No_Time_stamp"
+    Name_Of_Check = "No_Check_Name"
+    threshold_minutes = 17
+    time_diff_next1 = threshold_minutes + 1
+    for i in range(1, len(merged_df)-1):
+        if merged_df.iloc[i]['°F'] < (merged_df.iloc[i]['Cool SP'] + 0.5) and merged_df.iloc[i]['Mode'] == 'Cooling' and merged_df.iloc[i]['kW'] > 2.5:
+            if merged_df.iloc[i+1]['°F'] < (merged_df.iloc[i+1]['Cool SP'] + 0.5) and merged_df.iloc[i+1]['Mode'] == 'Cooling' and merged_df.iloc[i+1]['kW'] > 2.5:
+                time_diff_next1 = (merged_df.iloc[i+1]['Timestamp'] - merged_df.iloc[i]['Timestamp']).total_seconds() / 60.0
+                if time_diff_next1 < threshold_minutes:
+                    Reprting_Time_Stamp = merged_df.iloc[i]['Timestamp']
+                    Name_Of_Check = f"Compressor run ignoring free cooling Opportunity of {merged_df.iloc[i]['kW'] / 2:.2f} kWh"
+                    text_strings = [location_name, rtu_name, str(Reprting_Time_Stamp), Name_Of_Check]
+                    gu += 1
+                    i +=1
+                    Sub_List.append(text_strings)
+        elif gu == 0 and i == len(merged_df) - 2:
+            Reprting_Time_Stamp = merged_df.iloc[i]['Timestamp']  # Ensure this is set even if no findings
+            Name_Of_Check = "No findings on Compressor being run ignoring free cooling Opportunity"
+            text_strings = [location_name, rtu_name, str(Reprting_Time_Stamp), Name_Of_Check]
+            Sub_List.append(text_strings)
+            
+    # identify Unit Free heating scope
+    gu = 0
+    Reprting_Time_Stamp = "No_Time_stamp"
+    Name_Of_Check = "No_Check_Name"
+    threshold_minutes = 17
+    time_diff_next1 = threshold_minutes + 1
+    for i in range(1, len(merged_df)-1):
+        if merged_df.iloc[i]['°F'] > (merged_df.iloc[i]['Heat SP'] - 0.5) and merged_df.iloc[i]['Mode'] == 'Heating' and merged_df.iloc[i]['kW'] > 2.5:
+            if merged_df.iloc[i+1]['°F'] > (merged_df.iloc[i+1]['Heat SP'] - 0.5) and merged_df.iloc[i+1]['Mode'] == 'Heating' and merged_df.iloc[i+1]['kW'] > 2.5:
+                time_diff_next1 = (merged_df.iloc[i+1]['Timestamp'] - merged_df.iloc[i]['Timestamp']).total_seconds() / 60.0
+                if time_diff_next1 < threshold_minutes:
+                    Reprting_Time_Stamp = merged_df.iloc[i]['Timestamp']
+                    Name_Of_Check = f"Compressor run ignoring free heating Opportunity of {merged_df.iloc[i]['kW'] / 2:.2f} kWh"
+                    text_strings = [location_name, rtu_name, str(Reprting_Time_Stamp), Name_Of_Check]
+                    gu += 1
+                    i +=1
+                    Sub_List.append(text_strings)
+        elif gu == 0 and i == len(merged_df) - 2:
+            Reprting_Time_Stamp = merged_df.iloc[i]['Timestamp']  # Ensure this is set even if no findings
+            Name_Of_Check = "No findings on heating by ignoring free heating Opportunity"
+            text_strings = [location_name, rtu_name, str(Reprting_Time_Stamp), Name_Of_Check]
+            Sub_List.append(text_strings)
+
+             
+            
+    return Sub_List
+
+# Input the directory path containing RTU data files
+directory_path = input("Enter the path to the directory containing RTU data files: ").strip()
+
+# Initialize a list to hold the results
+results = []
+
+# Iterate through each file in the specified directory
+for file_name in os.listdir(directory_path):
+    if file_name.endswith(".xlsx"):
+        file_path = os.path.join(directory_path, file_name)
+        result = process_rtu_file(file_path)
+        if result:
+            results.extend(result)
+
+if results:
+    # Create a DataFrame from the results
+    results_df = pd.DataFrame(results, columns=['Location', 'RTU', 'Time', 'NameOfCheck'])
+
+    # Save the results to a new Excel file in the specified directory
+    new_directory = "Results"
+    directory_path1 = os.path.join(directory_path, new_directory)
+    result_file_path = os.path.join(directory_path1, 'RTU_Analysis_Result.xlsx')
+
+    os.makedirs(directory_path1, exist_ok=True)
+
+    results_df.to_excel(result_file_path, index=False)
+
+    print(f"Analysis complete. Results saved to {result_file_path}")
+else:
+    print("No results to save.")
